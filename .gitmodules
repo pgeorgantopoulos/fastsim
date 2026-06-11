@@ -1,0 +1,3 @@
+[submodule "CaloChallenge"]
+	path = code
+	url = https://github.com/OzAmram/CaloChallenge.git
