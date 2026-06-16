@@ -8,6 +8,7 @@ __pycache__/
 *.h5
 *.pt
 *.hdf5
+*.hd5
 
 # Distribution / packaging
 .Python
