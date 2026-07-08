@@ -2,7 +2,7 @@
 
 Based on the details from the paper ***"A Generalisable Generative Model for Multi-Detector Calorimeter Simulation" (arXiv:2509.07700)***, here is the breakdown of the model's architecture, underlying PyTorch components, and hyperparameters:
 
-### 1. Architecture & Underlying PyTorch Models
+## 1. Architecture & Underlying PyTorch Models
 
 **CaloDiT-2** is an advanced generative model designed for fast calorimeter particle shower simulations in high-energy physics, integrated directly into the Geant4 simulation toolkit:
 
@@ -10,7 +10,7 @@ Based on the details from the paper ***"A Generalisable Generative Model for Mul
 * **Distillation Framework:** It incorporates **Consistency Distillation (CD)**. During training, a student model is trained from a pretrained EDM teacher model to bypass multi-step ODE solving, shrinking inference down to a single evaluation step.
 * **Modality Adaptation:** Showers are tokenized via a large-patch representation (similar to ViTs). To support multiple detectors, it models universal 3D cylindrical grids ($N \times R \times \phi$) using local radiation lengths and Molière radii, rendering the data representation detector-agnostic.
 
-### 2. Model Hyperparameters
+## 2. Model Hyperparameters
 
 The model uses a lightweight yet scalable transformer backbone config:
 
@@ -21,13 +21,13 @@ The model uses a lightweight yet scalable transformer backbone config:
 * A categorical one-hot geometry vector $G$ of size $K + 1$ (where $K$ represents pretrained detector geometries, plus an extra slot to allow zero-shot/few-shot adaptation to a novel unseen detector layout).
 
 
-### 3. Training Hyperparameters
+## 3. Training Hyperparameters
 
 * **Optimization / Fine-Tuning Learning Rate:** Standard pre-training is performed across broad datasets (such as the 5-million shower LEMURS dataset). For downstream adaptation (transfer learning) onto a newly introduced detector, the learning rate is aggressively constrained to $\le 1 \times 10^{-3}$.
 * **Data & Step Efficiency:** Due to the pre-training strategy, adapting the model to novel geometries requires up to **25× less data** and **20× fewer training steps** compared to training from scratch.
 * **Infrastructure Framework:** The PyTorch codebase relies on Hugging Face `Accelerate` for distributed multi-GPU training, tracking progress via Weights & Biases (`wandb`). The final architectures are exported via `LibTorch` and `ONNX` to accommodate C++ inference wrappers within production simulation loops.
 
-### 4. Detailed Technical Specifications (from paper)
+## 4. Detailed Technical Specifications (from paper)
 
 **Data Preprocessing:**
 
@@ -65,62 +65,178 @@ $$\mathcal{L}_{\text{CD}} = \mathbb{E}\!\left[\lambda(t_n)\,\|f_\zeta(x_{t_{n+1}
 * $\lambda(t_n) = 1$; target network $\zeta^-$ updated via EMA with decay $\mu = 0.95$
 * Student initialised from teacher weights; trained for **100K steps** with AdamW, lr = 5×10⁻⁴
 
+## ALTERNATIVE Summary (Copilot)
 
-# DDIM+T vs CaloDiT-2
+Now let me get more details on the preprocessing and the full CaloDiT architecture:## Summary: NN Backbone, Preprocessing, and Data Flow in `validate.py`
 
-## Model & Data Comparison: `ddim_transformer.ipynb` vs. CaloDiT-2
+### **1. NN Backbone: CaloDiT**
 
-### Data Representation
+**Architecture:**
+- **DiT-based (Diffusion Transformer)** inspired by [Facebook's DiT](https://github.com/facebookresearch/DiT)
+- **Key Components:**
+  - **Patch Embedding (VolumeEmbedder):** Converts 3D shower volume to patches and projects to embedding dimension
+  - **Positional Embeddings:** 3D sinusoidal position encoding (frozen, not learned)
+  - **Timestep Embedder:** Embeds diffusion timestep `t` via sinusoidal → 2-layer MLP
+  - **Condition Embedders:** Multiple MLPs for embedding conditions (energy, phi, theta, geometry)
+  - **Transformer Blocks (CaloDiTBlock):** `num_layers` blocks with:
+    - Multi-head attention (adaptive Layer Norm modulation)
+    - MLP (GELU activation)
+    - Residual connections + gating
+  - **Final Layer:** Reconstructs patches with adaptive normalization
+  - **Unpatchify (VolumeUnembedder):** Unpacks patches back to 3D volume
 
-| Aspect | `ddim_transformer.ipynb` | CaloDiT-2 |
-|---|---|---|
-| Dataset | LEMURS HDF5, single geometry (`SiW_gamma`) | LEMURS 5M-shower multi-geometry dataset |
-| Voxel grid | `(45, 16, 9)` = 6,480 voxels, D×H×W | Same `45 × 9 × 16` standard, but with detector-agnostic normalization |
-| Spatial axes | Raw integer bins (N_layers, N_alpha, N_r) | Physical units: local radiation lengths + Molière radii |
-| Preprocessing | `log(E + ε)`, scaled to `[-1, 1]`; global min/max | Clip < 15.1 keV → 0, then `x̂ = (log(x + ε) - μ) / σ` with per-dataset μ, σ; ε = 1e-6 |
-| Conditioning | One scalar: `log10(E_inc)` | `(E, φ, θ)` + one-hot geometry vector `G` of size `K+1` |
-| Multi-detector | No — single fixed geometry | Core design goal; zero/few-shot transfer to new detectors |
-
-The most significant gap is in conditioning. The notebook model receives a single energy scalar; CaloDiT-2 receives full incident kinematics plus a geometry token that makes the same model work across multiple detectors without retraining.
-
----
-
-### Model Architecture
-
-| Aspect | `ddim_transformer.ipynb` | CaloDiT-2 |
-|---|---|---|
-| Backbone | 3D U-Net (`UNet3D`) with convolutional encoder-decoder + skip connections | Pure Diffusion Transformer (DiT) — no convolutions |
-| Attention | `SelfAttn3D` at the coarsest spatial level only (voxel-flattened tokens) | Global self-attention at all layers (token sequence throughout) |
-| Conditioning mechanism | FiLM (scale + shift) in every `ResBlock3D` | Concatenated embedding `c` (from projected E, φ, θ, t, G) injected into every DiT block |
-| Patch tokenization | `PatchEmbed3D` is implemented but **not yet wired** into `UNet3D.forward` — it remains a conceptual sketch | Patch size **3×2×3** → **360 tokens**; 3D sinusoidal positional encoding (r/φ/z each occupy 1/3 of embedding space) |
-| Depth / width | `base_ch=8`, `ch_mults=(1,2,4,8)` in the saved checkpoint | 6 transformer layers, hidden dim 384 |
-| Inductive bias | Strong spatial locality bias from Conv3d, local skip connections | Minimal inductive bias — long-range dependencies from token attention |
-| Inference export | Plain PyTorch | LibTorch + ONNX for C++ production integration in Geant4 |
-
-The transformer blocks (`PatchEmbed3D` and `TransformerBlock`) are defined and documented in the notebook but disconnected from the `UNet3D` forward pass — the trained checkpoint still uses the pure convolutional UNet.
+**Config (from edm_allegro_scratch):**
+```yaml
+input_size: [9, 16, 45]        # (R, PHI, Z) dimensions
+patch_size: [3, 2, 3]           # patch dimensions
+conditions_size: [1, 2, 1]      # (energy, phi_2d, theta)
+emb_dim: 384
+num_layers: 6
+num_heads: 6
+mlp_ratio: 4
+```
 
 ---
 
-### Diffusion Formulation
+### **2. Data Preprocessing Pipeline**
 
-| Aspect | `ddim_transformer.ipynb` | CaloDiT-2 |
-|---|---|---|
-| Framework | Discrete-time DDPM/DDIM (T=1000) | Continuous-time EDM (Probability Flow ODE) |
-| Training objective | MSE on predicted noise `ε` | EDM: `ℒ = E[λ(t)‖c_skip·x + c_out·vθ(c_in·x, c_noise) − x₀‖₂²]`; σ_data=0.5, σ_max=80 |
-| Sampling | DDIM with configurable steps (e.g. 50) and `η` | CD: `ℒ_CD = E[λ(t_n)‖f_ζ(x_{t+1}, t+1) − f_ζ⁻(x_t, t)‖₂²]`; 32 sub-intervals, EMA μ=0.95 → **single-step** |
-| Stochasticity | Tunable via `η`: 0 = deterministic, 1 = DDPM | Deterministic single-step student |
-| NFE at inference | ~50 steps typical | 1 step (after distillation) |
+**Shower Preprocessing (on raw calorimeter deposits):**
+1. **CutNoise:** Remove energies below `noise_level=1.515e-05` GeV (energy readout threshold)
+2. **LogTransform:** `log(x + eps)` with `eps=1e-6`
+3. **Standardize:** `(x - mean) / std` with `mean=-10.766, std=3.5773`
 
-This is the deepest architectural gap. DDIM cuts inference from 1000 to ~50 steps; CaloDiT-2's consistency distillation further compresses that to 1 step, which is what Geant4 integration actually needs for production speed.
+**Condition Preprocessing (on incident particle parameters):**
+- **Energy:** Normalized to [0, 1] by dividing by 1000 GeV max
+- **Phi:** Converted from radians to 2D representation `[sin(φ), cos(φ)]`
+- **Theta:** Normalized to [0, 1] using `(θ - θ_min) / (θ_max - θ_min)`
+- **Geometry (optional):** One-hot encoding appended (for multi-geometry models)
 
 ---
 
-### Summary
+### **3. Data Flow in `validate.py`**
 
-The notebook is a clean, complete DDIM baseline on the same LEMURS voxel grid, with a solid U-Net backbone and a well-structured extension point for transformers. CaloDiT-2 goes in three orthogonal directions:
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ validate.py Data Flow                                               │
+└─────────────────────────────────────────────────────────────────────┘
 
-1. **Architecture** — replaces the U-Net with a full DiT (patch tokens, global attention everywhere)
-2. **Diffusion** — moves from discrete DDPM/DDIM to continuous EDM, then distills to single-step consistency
-3. **Generalization** — adds multi-detector conditioning so one model covers multiple geometries with few-shot transfer
+For each condition (geometry, energy, phi, theta):
 
-The next natural step would be to complete the wiring of `PatchEmbed3D` + `TransformerBlock` into the forward pass, replacing or augmenting the bottleneck first (lowest spatial resolution, most global features), which mirrors how CaloDiT-2 achieves full-sequence attention without the U-Net's per-voxel convolution cost.
+1. LOAD & PREPARE
+   └─ CaloShowerDataset(files=[fullsim_path], need_geo_condn)
+      └─ Load reference showers from H5 file
+
+2. BATCH & PREPROCESS (Training Loop)
+   for sample in DataLoader:
+      showers, conditions = sample  # Raw data
+      │
+      ├─ preprocessor.transform(conditions)
+      │  └─ ConditionsPreprocessor: normalize energy/phi/theta
+      │     └─ conditions_processed
+      │
+      ├─ cut_below_noise_level(showers)  # Remove noise
+      │  └─ original_events (for comparison)
+      │
+      └─ FORWARD PASS:
+         ├─ model.sample(conditions, progress=True, **cfg.sampling)
+         │  ├─ Diffusion reverse process (iterative denoising)
+         │  ├─ Calls CaloDiT iteratively with timestep conditioning
+         │  └─ Returns generated showers (noisy → clean)
+         │
+         └─ preprocessor.inverse_transform(generated_events, conditions)
+            └─ LogTransform⁻¹ → Standardize⁻¹
+               └─ generated_events (physical scale)
+
+3. COLLECT & SAVE
+   original_events = concatenate all batches    → Geant4 reference
+   generated_events = concatenate all batches   → CaloDiT output
+   
+   save_showers(generated_events, ...) → H5 file
+
+4. EVALUATE
+   compare_observables(original_events, generated_events)
+   └─ Compute EMD distances on observables (energy, angular profiles)
+```
+
+---
+
+### **Key Points:**
+
+- **Backbone:** Vision Transformer adapted for 3D calorimeter data (patches + adaptive conditioning)
+- **Preprocessing:** Noise cutting → log transform → standardization (reversible)
+- **Conditioning:** Timestep + incident particle physics (E, φ, θ) + geometry
+- **Forward Pass:** Diffusion sampling (not training) — iterative denoising with model predictions
+- **Output:** Generated showers + comparison metrics (EMD)
+
+### Training Data
+
+From `configs/train/edm_allegro_scratch.yaml`:
+
+**Training (parts 1–4):**
+```
+- ddsim_mesh_FCCeeALLEGRO_gamma_100kevents_1GeV100GeV_GPSFlat_edm4hep_13245648_part1.h5
+- ddsim_mesh_FCCeeALLEGRO_gamma_100kevents_1GeV100GeV_GPSFlat_edm4hep_13245648_part2.h5
+- ddsim_mesh_FCCeeALLEGRO_gamma_100kevents_1GeV100GeV_GPSFlat_edm4hep_13245648_part3.h5
+- ddsim_mesh_FCCeeALLEGRO_gamma_100kevents_1GeV100GeV_GPSFlat_edm4hep_13245648_part4.h5
+```
+All located at: `/eos/geant4/fastSim/ddfastsim/FCCeeALLEGRO/dataset2_1GeV100GeVFlat_theta0p87to2p27_phiFull/`
+
+**Validation (part 10):**
+```
+- ddsim_mesh_FCCeeALLEGRO_gamma_100kevents_1GeV100GeV_GPSFlat_edm4hep_13245648_part10.h5
+```
+
+### Testing/Validation Data
+
+From `configs/validate/default.yaml`:
+
+The validation script compares generated showers against **8 different datasets** (discrete, held-out from training):
+
+| Geometry | Energy | File |
+|----------|--------|------|
+| Par04 | 50 GeV | `ddsim_mesh_Par04_gamma_1000events_50GeV_phi0.0_theta1.57_edm4hep_9246142.0.h5` |
+| Par04 | 500 GeV | `ddsim_mesh_Par04_gamma_1000events_500GeV_phi0.0_theta1.57_edm4hep_9246143.0.h5` |
+| SciPb | 50 GeV | `ddsim_mesh_Par04_gamma_1000events_50GeV_phi0.0_theta1.57_edm4hep_13208241.0.h5` |
+| SciPb | 500 GeV | `ddsim_mesh_Par04_gamma_1000events_500GeV_phi0.0_theta1.57_edm4hep_13208242.0.h5` |
+| ODD | 50 GeV | `ddsim_mesh_ODD_gamma_1000events_50GeV_phi0.0_theta1.57_edm4hep_9260460.0.h5` |
+| ODD | 500 GeV | `ddsim_mesh_ODD_gamma_1000events_500GeV_phi0.0_theta1.57_edm4hep_9260457.0.h5` |
+| CLD | 5 GeV | `ddsim_mesh_FCCeeCLD_gamma_1000events_5GeV_phi0.0_theta1.57_edm4hep_13208262.0.h5` |
+| CLD | 50 GeV | `ddsim_mesh_FCCeeCLD_gamma_1000events_50GeV_phi0.0_theta1.57_edm4hep_9292534.0.h5` |
+
+**Key difference:** Training uses only **FCCeeALLEGRO** (1 geometry), while validation tests across **4 geometries** (Par04, SciPb, ODD, CLD) at discrete energy points. The validation files are also completely separate from training—no overlap.
+
+### Validation Metrics
+
+1. Longitudinal Profile Observables
+
+    LongTotalEnergy — Energy deposited per Z-layer
+    LongTotalHits — Number of hits per Z-layer
+    LongFirstMoment — Mean depth <z> distribution
+    LongSecondMoment — Depth variance <z²> distribution
+    LongEventEnergy — Per-layer energy distribution across events (9 layers)
+
+2. Radial Profile Observables
+
+    RadTotalEnergy — Energy deposited per radial bin (R-direction)
+    RadTotalHits — Number of hits per radial bin
+    RadFirstMoment — Mean radius <r> distribution
+    RadSecondMoment — Radial variance <r²> distribution
+    RadEventEnergy — Per-layer energy distribution (3×3 grid)
+
+3. Azimuthal Profile Observables
+
+    AzimTotalEnergy — Energy deposited per φ-bin
+    AzimTotalHits — Number of hits per φ-bin
+    AzimFirstMoment — Mean azimuthal angle <φ> distribution
+    AzimSecondMoment — Azimuthal variance <φ²> distribution
+    AzimEventEnergy — Per-layer energy distribution (4×4 grid)
+
+4. Global Shower Observables
+
+    TotalEventEnergy — Total energy per event distribution
+    TotalEventHits — Total hits per event distribution
+    CellEnergy — Individual cell energy distribution (linear scale)
+    CellLogEnergy — Individual cell energy distribution (log₁₀ scale)
+    CellEnergy_xlog — Cell energy with log-scale x-axis
+
+
