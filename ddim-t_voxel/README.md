@@ -47,7 +47,7 @@ To integrate transformer blocks into the UNet3D, you would typically follow a st
 
 train() — standard loop with gradient clipping, cosine-annealing LR, AMP (`torch.autocast` + `GradScaler`) on CUDA, periodic checkpointing (model/opt/sched/scaler state), resume-from-latest-checkpoint via `cfg["scratch"]`, and optional per-epoch wandb logging of loss/LR.
 
-`load_model_from_checkpoint()` (in `../utilities.py`) loads the most recent checkpoint under `ckpt_dir` and rebuilds the model/scheduler from the `cfg` stored inside it, so eval always matches the architecture it was trained with.
+`load_model_from_checkpoint()` (in `../utilities.py`) is a model-agnostic backbone: it loads the most recent checkpoint under `ckpt_dir` and calls this notebook's `model_builder`/`scheduler_builder` lambdas (closing over `UNet3D`/`DDIMScheduler`) with the `cfg` stored inside the checkpoint, so eval always matches the architecture it was trained with — the same backbone is reused as-is by `cfm-dit_voxel`, which supplies its own builders instead.
 
 ## Pseudocode
 
@@ -99,9 +99,13 @@ After loading the checkpoint, the notebook runs an energy sweep and compares gen
 showers against Geant4 ground truth from the test file:
 
 * **Sweep generation** — for each `E_INC ∈ {1, 10, 100, 1000, 2000} GeV`, calls
-  `generate()` (in `../utilities.py`) to draw `N_SWEEP=100` DDIM samples (50 steps,
-  η=0) conditioned on that energy, and pulls matching ground-truth showers from
-  `test_data_path` via a `±2x` energy-window mask.
+  `generate()` (in `../utilities.py`), passing `scheduler.ddim_sample` as its
+  `sample_fn` with `steps=50, eta=0.0`, to draw `N_SWEEP=100` DDIM samples
+  conditioned on that energy, and pulls matching ground-truth showers from
+  `test_data_path` via a `±2x` energy-window mask. `generate()` itself only builds
+  the energy-conditioning tensor and shape — the DDIM reverse process is supplied
+  via `sample_fn`, so the same backbone works for `cfm-dit_voxel`'s flow-matching
+  ODE integration too.
 * **Z-profiles** — per energy, plots per-shower energy deposit summed over (φ, r) vs.
   depth layer, generated overlaid on ground truth, to check longitudinal shower shape.
 * **Energy distribution / radial profile comparison** — reshapes sweep data from

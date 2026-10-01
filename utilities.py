@@ -241,14 +241,23 @@ def ddim_calochallenge_dataloaders(cfg: dict, hlf, log_eps: float = 1e-6,
 
 
 def multi_geometry_dataloaders(cfg: dict, hlf, log_eps: float = 1e-6, train_split: float = 0.8):
-    """Build a combined dataloader across two real geometries:
+    """Build a combined dataloader across two *trained* real geometries:
     CaloChallenge Dataset 2 (SiW, ``geom_id=0``, fixed incidence) and LEMURS
-    FCCeeALLEGRO (``geom_id=1``, variable incidence angle).
+    Par04SiW (``geom_id=1``, variable incidence angle).
 
     Both are reshaped to the same ``(Z, PHI, R) = voxel_shape`` axis order and
     log-normalised to ``[-1, 1]`` with their *own* fitted min/max — different
     detectors/absorbers have different deposit-energy scales, so a shared
     normalisation would over/under-saturate one of them.
+
+    Optionally also fits a log-normalisation inverse for a third, **held-out**
+    geometry (``cfg["heldout_data_path"]``, tagged ``geom_id=2``) — e.g. LEMURS
+    FCCeeALLEGRO. That geometry is *never* added to ``train_ds``/``test_ds``: no
+    gradient ever touches it. Only its own min/max is fit from its showers, so
+    ``inverses[2]`` can map generated samples back to MeV for a zero-shot
+    generalisation eval (mirrors CaloDiT-2's held-out-detector methodology).
+    Omit ``heldout_data_path`` to skip this — ``inverses`` then only has keys
+    0 and 1.
 
     Parameters
     ----------
@@ -257,19 +266,22 @@ def multi_geometry_dataloaders(cfg: dict, hlf, log_eps: float = 1e-6, train_spli
         CaloChallenge train/held-out slices by ``CaloChallenge.from_config`` —
         ``calo_test_data_path`` is *not* read by this function, only by eval code
         that pulls ground-truth showers from that separate file directly),
-        ``lemurs_data_path``, ``showers_key`` (shared — both files use ``"showers"``),
+        ``lemurs_data_path``, ``showers_key`` (shared — all files use ``"showers"``),
         ``lemurs_energies_key`` (LEMURS uses ``"incident_energy"``, singular — distinct
         from CaloChallenge's hardcoded ``"incident_energies"``), ``lemurs_phi_key``,
         ``lemurs_theta_key``, ``voxel_shape`` (CaloChallenge/model convention, e.g.
-        ``(45, 16, 9)``), ``batch_size``. Optional: ``n_samples``.
+        ``(45, 16, 9)``), ``batch_size``. Optional: ``n_samples``, ``heldout_data_path``
+        (enables the ``geom_id=2`` inverse described above), ``heldout_n_samples``
+        (caps how many showers are loaded to fit that inverse; default: whole file).
     hlf : HighLevelFeatures
         Initialised HLF object matching the CaloChallenge binning.
 
     Returns
     -------
     train_loader, test_loader, inverses
-        Each batch is ``(x, cond, phi, theta, geom_id)``. ``inverses`` is a dict
-        ``{geom_id: inverse_fn}``, each mapping a ``[-1, 1]`` array back to raw
+        Each batch is ``(x, cond, phi, theta, geom_id)`` for geom_id in {0, 1} only
+        — the held-out geometry never appears in either loader. ``inverses`` is a
+        dict ``{geom_id: inverse_fn}``, each mapping a ``[-1, 1]`` array back to raw
         MeV deposits for that geometry.
     """
     THETA_FIXED = math.pi / 2   # CaloChallenge Dataset 2: perpendicular incidence
@@ -296,7 +308,7 @@ def multi_geometry_dataloaders(cfg: dict, hlf, log_eps: float = 1e-6, train_spli
 
     calo_train.transform = calo_test.transform = calo_forward
 
-    # --- LEMURS FCCeeALLEGRO — geom_id = 1 -------------------------------------
+    # --- LEMURS Par04SiW — geom_id = 1 ------------------------------------------
     lemurs_raw_shape = tuple(reversed(cfg["voxel_shape"]))   # (45,16,9) -> (9,16,45) = (R,PHI,Z)
     lemurs_cfg = {**cfg, "train_data_path": cfg["lemurs_data_path"], "voxel_shape": lemurs_raw_shape,
                   "energies_key": cfg["lemurs_energies_key"]}
@@ -330,24 +342,53 @@ def multi_geometry_dataloaders(cfg: dict, hlf, log_eps: float = 1e-6, train_spli
                               num_workers=2, pin_memory=True, drop_last=False)
 
     inverses = {0: calo_inverse, 1: lemurs_inverse}
+
+    # --- held-out geometry (e.g. LEMURS FCCeeALLEGRO) — geom_id = 2, fit-only ---
+    # Never added to train_ds/test_ds: no gradient touches this data. Only its own
+    # log-normalisation min/max is fit, so a trained model's generated samples can
+    # be mapped back to MeV for a zero-shot generalisation eval.
+    if cfg.get("heldout_data_path"):
+        heldout_raw_shape = tuple(reversed(cfg["voxel_shape"]))   # (45,16,9) -> (9,16,45)
+        with h5py.File(cfg["heldout_data_path"], "r") as f:
+            n_heldout = cfg.get("heldout_n_samples") or len(f[cfg["showers_key"]])
+
+        heldout_ds = LEMURS(cfg["heldout_data_path"], cfg["showers_key"],
+                            cfg.get("heldout_energies_key", cfg["lemurs_energies_key"]),
+                            heldout_raw_shape, data_slice=slice(0, n_heldout))
+
+        heldout_logged = np.log(heldout_ds.showers + log_eps)
+        ho_vmin, ho_vmax = float(heldout_logged.min()), float(heldout_logged.max())
+
+        def heldout_inverse(x_norm: np.ndarray) -> np.ndarray:
+            return np.exp((x_norm + 1) / 2 * (ho_vmax - ho_vmin) + ho_vmin) - log_eps
+
+        inverses[2] = heldout_inverse
+        print(f"Held-out (geom_id=2): {len(heldout_ds)} showers used only to fit "
+              f"log-norm range [{ho_vmin:.3f}, {ho_vmax:.3f}] — never trained on")
+
     return train_loader, test_loader, inverses
 
 
 # ─── Checkpointing ────────────────────────────────────────────────────────────
 
-def load_model_from_checkpoint(cfg: dict, model_cls, scheduler_cls):
+def load_model_from_checkpoint(cfg: dict, model_builder, scheduler_builder):
     """Load the latest checkpoint; return a ready-to-eval (model, scheduler) pair.
+
+    Model-agnostic backbone: finds the checkpoint, restores weights, reports
+    size — anything about *which* architecture/scheduler to build, and with what
+    kwargs, is delegated to the two builder callables so this function has no
+    knowledge of any specific model's constructor signature.
 
     Parameters
     ----------
     cfg : dict
-        Must contain ``ckpt_dir`` and ``device``.
-    model_cls : type
-        Constructor called with kwargs from the saved cfg:
-        ``voxel_shape``, ``base_ch``, ``ch_mults``, ``attn_res``, ``cond_dim``.
-    scheduler_cls : type
-        Constructor called with kwargs ``T``, ``beta_min``, ``beta_max``,
-        ``schedule``, ``device``.
+        Must contain ``ckpt_dir`` and ``device`` (the device to load onto — may
+        differ from whatever device the checkpoint was saved from).
+    model_builder : callable(loaded_cfg) -> nn.Module
+        Builds an untrained model from the checkpoint's saved cfg. Moved to
+        ``cfg["device"]`` and put in eval mode by this function.
+    scheduler_builder : callable(loaded_cfg, device) -> scheduler/flow object
+        Builds the matching scheduler/flow object from the checkpoint's saved cfg.
     """
     device   = cfg["device"]
     ckpt_dir = Path(cfg["ckpt_dir"])
@@ -360,23 +401,19 @@ def load_model_from_checkpoint(cfg: dict, model_cls, scheduler_cls):
     print(f"Loading {ckpts[-1]}  (epoch {state['epoch'] + 1})")
     print(loaded_cfg)
 
-    model = model_cls(
-        voxel_shape = loaded_cfg["voxel_shape"],
-        base_ch     = loaded_cfg["base_ch"],
-        ch_mults    = loaded_cfg["ch_mults"],
-        attn_res    = loaded_cfg["attn_res"],
-        cond_dim    = loaded_cfg["cond_dim"],
-    ).to(device)
-    model.load_state_dict(state["model"])
+    model = model_builder(loaded_cfg).to(device)
+
+    # torch.compile-wrapped checkpoints (cfg["compile"]=True) prefix every state_dict
+    # key with "_orig_mod." -- strip it so this loads regardless of whether the
+    # checkpoint being loaded was saved compiled or not.
+    state_dict = {
+        (k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k): v
+        for k, v in state["model"].items()
+    }
+    model.load_state_dict(state_dict)
     model.eval()
 
-    scheduler = scheduler_cls(
-        T        = loaded_cfg["T"],
-        beta_min = loaded_cfg["beta_min"],
-        beta_max = loaded_cfg["beta_max"],
-        schedule = loaded_cfg["schedule"],
-        device   = device,
-    )
+    scheduler = scheduler_builder(loaded_cfg, device)
 
     n_params     = sum(p.numel() for p in model.parameters())
     param_bytes  = sum(p.numel() * p.element_size() for p in model.parameters())
@@ -388,20 +425,29 @@ def load_model_from_checkpoint(cfg: dict, model_cls, scheduler_cls):
 
 # ─── Inference ────────────────────────────────────────────────────────────────
 
-def generate(model, scheduler, cfg: dict, inverse, n_samples: int = 4,
-             e_inc_gev: float = 10.0, ddim_steps: int = 50, eta: float = 0.0):
+def generate(model, sample_fn, cfg: dict, inverse, n_samples: int = 4,
+             e_inc_gev: float = 10.0, **sample_kwargs):
     """Generate shower samples conditioned on a fixed incident energy.
+
+    Model-agnostic backbone: builds the energy-conditioning tensor and output
+    shape, runs ``sample_fn`` under ``no_grad``, then clamps and inverse-transforms
+    the result. Anything model-specific — the scheduler/flow's reverse process,
+    extra conditioning (angle, geometry), step count/integration method — lives in
+    ``sample_fn``, supplied by the calling notebook.
 
     Parameters
     ----------
     model : nn.Module
-    scheduler : DDIMScheduler-like — must implement ``ddim_sample``.
+    sample_fn : callable(model, shape, cond, **sample_kwargs) -> Tensor in [-1, 1]
+        E.g. a ``DDIMScheduler.ddim_sample`` bound method, or a small
+        notebook-defined wrapper that also builds angle/geometry conditioning
+        tensors before calling a flow's ``sample``.
     cfg : dict — must contain ``device`` and ``voxel_shape``.
     inverse : callable — maps [-1, 1] array back to MeV deposits.
     n_samples : int
     e_inc_gev : float — incident energy in GeV.
-    ddim_steps : int
-    eta : float — 0 = deterministic DDIM, 1 = DDPM-equivalent stochasticity.
+    **sample_kwargs
+        Forwarded to ``sample_fn`` (e.g. ``steps``/``eta``, or ``phi``/``theta``/``geom_id``).
 
     Returns
     -------
@@ -413,7 +459,7 @@ def generate(model, scheduler, cfg: dict, inverse, n_samples: int = 4,
     cond    = torch.full((n_samples,), math.log10(e_inc_gev * 1e3), device=device)
     shape   = (n_samples, 1, D, H, W)
     with torch.no_grad():
-        samples = scheduler.ddim_sample(model, shape, cond, steps=ddim_steps, eta=eta)
+        samples = sample_fn(model, shape, cond, **sample_kwargs)
     return inverse(samples.clamp(-1, 1).cpu().numpy())
 
 
@@ -506,6 +552,70 @@ def plot_shower_3d(shower3d, i_idx=0, incident_energy=None, threshold=1):
     )
 
     return fig
+
+
+def make_shower_layer_video(shower3d, i_idx=0, incident_energy=None, out_path='shower_layers.mp4',
+                             seconds_per_layer=1.0, threshold=1., cmap='viridis'):
+    """Render an MP4 of a single shower's (R, PHI) energy profile, one layer per second.
+
+    Parameters
+    ----------
+    shower3d : ndarray (R, PHI, Z)
+        Single shower, e.g. ``showers[i_idx]``.
+    i_idx : int
+        Event index, used only for the title.
+    incident_energy : float or None
+        Incident energy in MeV; shown in the title when provided.
+    out_path : str
+        Where to write the .mp4.
+    seconds_per_layer : float
+        Playback duration of each layer (drives fps = 1 / seconds_per_layer).
+    threshold : float
+        Voxels below this value (MeV) are shown as zero, matching ``plot_shower_3d``.
+    cmap : str
+
+    Returns
+    -------
+    str — ``out_path``.
+    """
+    from matplotlib.animation import FFMpegWriter
+    from matplotlib.colors import LogNorm
+
+    num_rad, num_ang, num_layers = shower3d.shape
+    shower3d = np.where(shower3d >= threshold, shower3d, 0.)
+
+    phi_edges = np.linspace(0, 2 * np.pi, num_ang + 1)
+    r_edges   = np.arange(num_rad + 1)
+    vmax = shower3d.max()
+    norm = LogNorm(vmin=max(threshold, 1e-3), vmax=vmax if vmax > 0 else 1.)
+
+    fig  = plt.figure(figsize=(6, 6))
+    ax   = fig.add_subplot(projection='polar')
+    ax.set_theta_zero_location('N')
+    ax.set_xticklabels([])
+    ax.set_yticklabels([])
+    mesh = ax.pcolormesh(phi_edges, r_edges, shower3d[:, :, 0], norm=norm, cmap=cmap)
+    cbar = fig.colorbar(mesh, ax=ax, pad=0.1, label='Energy (MeV)')
+
+    title_prefix = f"Shower #{i_idx}"
+    if incident_energy is not None:
+        title_prefix += f" — E$_{{inc}}$ = {float(np.squeeze(incident_energy)) / 1e3:.2f} GeV"
+    title = ax.set_title(f"{title_prefix}\nLayer 0/{num_layers - 1}")
+
+    def update(z):
+        mesh.set_array(shower3d[:, :, z].ravel())
+        title.set_text(f"{title_prefix}\nLayer {z}/{num_layers - 1}")
+        return mesh, title
+
+    fps = 1. / seconds_per_layer
+    writer = FFMpegWriter(fps=fps)
+    with writer.saving(fig, out_path, dpi=150):
+        for z in range(num_layers):
+            update(z)
+            writer.grab_frame()
+    plt.close(fig)
+
+    return out_path
 
 
 def plot_z_profiles(showers, gen_showers=None, filename='', i_idcs=None,
@@ -776,9 +886,10 @@ def plot_comparison(ref_showers, ref_energies, gen_showers, gen_energies,
         ref_vox = ref_sel.flatten()
         gen_vox = gen_sel.flatten() if len(gen_sel) > 0 else np.zeros(1)
         ref_nz  = ref_vox[ref_vox > 0]
-        gen_nz  = gen_vox[gen_vox > 0] if gen_vox.any() else np.zeros(1)
+        gen_nz  = gen_vox[gen_vox > 0]
 
-        vmax   = max(ref_nz.max(), gen_nz.max()) if len(ref_nz) > 0 else 1.
+        cand   = [a.max() for a in (ref_nz, gen_nz) if len(a) > 0]
+        vmax   = max(cand) if cand else 1.
         bins_e = np.linspace(0, vmax, 51)
 
         ax0.set_title(f'Energy Distribution\n$E_{{inc}}$ = {E:.0f} MeV')

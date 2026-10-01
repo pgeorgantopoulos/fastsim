@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c ' *)",
+      "Bash(/home/pgeorgantopoulos/.venvs/torchspde/bin/python3.10 -c ' *)"
+    ]
+  }
+}

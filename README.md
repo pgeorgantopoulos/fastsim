@@ -1,6 +1,139 @@
+# Experiments
+
+* TURING asks for generalization accros particle types, geometries and tasks.
+* The community of Fast Calorimeter Shower Simulation have used point-cloud or graph-based representations to achieve fast transfer learning to different geometries but not inference without retraining/additional training.
+* We propose an Neural SPDE model that combines:
+  - Fundamental energy dispersion in spatio-temporal model that arises physically from particle collision rules, geometry constraints, material constants, etc.
+  - Minimum dynamical modeling, so as to avoid constraining to already known SPDEs.
+
+# State Space IDEA
+
+## Continuous State-Space Model
+
+$$
+\boxed{
+\frac{\partial s(x,t)}{\partial t} + 
+\mathcal{L}s(x,t)
+=
+\mathcal{A}s(x,t)
++
+\mathcal{B}u\Big(s(x,t),x,t;\xi,E_{inc},\alpha_{inc}\Big),
+\qquad x\in\mathbb{R}^3
+}
+$$
+
+$$
+s(x,0)=s_0(x)\\
+%%u(s(x_0,0),x_0,0;\xi) = E_{inc}
+$$
+
+$$
+\boxed{
+y_i
+=
+\mathcal{C}_i[s(\cdot,T)]
+=
+\int_{\Omega_i}
+c_i(x)^T s(x,T)\,dx
+}
+$$
+
+where:
+
+- $s(x,t)$: local state of the calorimeter
+- $u(x,t;\xi)$: excitation process from the incoming particle
+- $y_i$: energy readout
+- $\mathcal{L}$: spatial differential operator
+- $\Omega_i$: i-th voxel continous space
+
+### Nonlinear Model
+
+$$
+\boxed{
+\frac{\partial s(x,t)}{\partial t} + \mathcal{L}s(x,t)
+=
+f\!\left(s(x,t),u(x,t;\xi),x,t\right),
+\qquad
+y_i=g_i\!\left(s(\cdot,T)\right)
+}
+$$
+
+---
+
+## Example Shower (Calorimeter + Entering Particle) State
+
+At each spatial location, the state can contain quantities such as deposited energy, temperature, density, and generated charge/excitations, material information:
+
+$$
+\boxed{
+s(x,t)=
+\begin{bmatrix}
+E_{\mathrm{W}} \\ 
+T_{\mathrm{W}} \\
+\rho_{\mathrm{W}} \\
+n_{\mathrm{exc,W}} \\
+E_{\mathrm{Si}} \\ 
+T_{\mathrm{Si}} \\ 
+\rho_{\mathrm{Si}} \\ 
+n_{eh}\\
+E_{\mathrm{LAr}} \\ 
+T_{\mathrm{LAr}} \\ 
+\rho_{\mathrm{LAr}} \\ 
+n_{\mathrm{ion}}\\
+\vdots
+\end{bmatrix}
+}
+$$
+
+$$
+s(x,0) := \textbf{Calorimeter state}
+$$
+
+where:
+
+- $E$: local deposited energy
+- $T$: temperature
+- $\rho$: material density
+- $n_{\mathrm{exc}}$: material excitations
+- $n_{eh}$: electron-hole pairs in silicon
+- $n_{\mathrm{ion}}$: ionization charge in liquid argon
+
+Also other material information included in $s(x,t)$ can be
+
+* $X_0$: radiation length
+* $R_M$: Molière radius
+* $E_c$: critical energy
+* $\rho$: density ρ
+* $Z$: effective Z
+
+Each detector material - subscripts
+
+- W = tungsten absorber
+- Si = silicon sensor
+- LAr = liquid argon
+
+has a different set of values.
+
+---
+
+## Interpretation
+
+$$
+\boxed{
+\text{Incoming particle}
+\rightarrow
+\text{calorimeter state evolution}
+\rightarrow
+\text{measured energy}
+}
+$$
+
+The model separates **geometry/material state**, **particle input**, **detector dynamics**, and **readout**.
+
+
 # Point Cloud & Graph-Based Models for Fast Calorimeter Simulation
 
-A literature collection on point cloud and graph-based generative models for fast calorimeter shower simulation (CaloChallenge, LEMURS, and other cell-hit level data), for comparison against voxel-based approaches.
+A literature collection of point cloud and graph-based generative models for fast calorimeter shower simulation (CaloChallenge, LEMURS, and other cell-hit level data), for comparison against voxel-based approaches.
 
 ## Calorimeter-specific point cloud models
 
